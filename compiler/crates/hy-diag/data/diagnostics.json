@@ -1,0 +1,464 @@
+{
+  "version": 1,
+  "updated": "2026-10-15",
+  "format": "HYB-Exxxx registry (SPEC-LANGUAGE.md §9.6; append-only, never renumbered, never reused)",
+  "categories": {
+    "E0": "parse / lexical",
+    "E1": "resolve (names, imports, visibility)",
+    "E2": "type errors",
+    "E3": "ownership & sendability (E30xx send/move/freeze, E31xx loans)",
+    "E4": "nil / zero-value safety",
+    "E5": "exhaustiveness & patterns",
+    "E6": "integer overflow / bounds",
+    "E7": "boundary (ABI, layout, foreign calls)",
+    "E8": "lint (warnings-only; can never fail the build)",
+    "E9": "tooling (build, cache, explain)"
+  },
+  "codes": [
+    {
+      "code": "HYB-E0001",
+      "name": "identifier-case",
+      "category": "parse",
+      "severity": "error",
+      "title": "Hybrid identifiers are snake_case",
+      "summary": "UpperCamelCase identifiers are rejected at binding time; foreign Go/Rust names are normalized when imported (SPEC M4).",
+      "fixits": [
+        "rename the identifier to snake_case, e.g. `worker_id` instead of `WorkerID`"
+      ],
+      "example": "WorkerID := 3   // reject: HYB-E0001 — write `worker_id`",
+      "rule": "LX"
+    },
+    {
+      "code": "HYB-E0002",
+      "name": "parse-error",
+      "category": "parse",
+      "severity": "error",
+      "title": "the program did not parse",
+      "summary": "Generic parse/lex error (the lexer's identifier-case violations keep HYB-E0001; everything else lands here). The diagnostic points at the failure site with the unexpected token named; recovery happens at the statement/declaration boundary.",
+      "fixits": [
+        "read the pointed-to site — the unexpected token is named in the message",
+        "check the line above: unterminated braces, strings, or missing separators surface on the following line"
+      ],
+      "example": "x := // reject: HYB-E0002 — expected expression, found end of line",
+      "rule": "P"
+    },
+    {
+      "code": "HYB-E0003",
+      "name": "managed-payload-required",
+      "category": "parse",
+      "severity": "error",
+      "title": "managed blocks need a reason and a category",
+      "summary": "The escape hatch must be review-visible: a bare `managed { ... }` (or an empty reason/category) is a reject, not a lint — what the hatch bypasses and why must be IN the program (discussion #4, PLAN row 14; fail-closed like the boundary rule FC).",
+      "fixits": [
+        "add the payload: managed(\"why this bypass is safe\", \"category\") { ... }",
+        "pick the category from the closed set: mutex, atomic, actor, finalizer, interop, other"
+      ],
+      "example": "managed { counts := map[string]int{} }   // reject: HYB-E0003 — write managed(\"shared map across tasks\", \"mutex\") { ... }",
+      "rule": "MANAGED",
+      "tier0_rule_id": "MANAGED"
+    },
+    {
+      "code": "HYB-E0004",
+      "name": "managed-unknown-category",
+      "category": "parse",
+      "severity": "error",
+      "title": "unknown managed category",
+      "summary": "The category is a CLOSED set so reviewers know which invariant a block bypasses without reading prose (discussion #4). Unknown categories are rejected; `other` exists for everything else and requires the reason to carry the specifics.",
+      "fixits": [
+        "use one of the closed set: mutex, atomic, actor, finalizer, interop, other"
+      ],
+      "example": "managed(\"r\", \"misc\") { ... }   // reject: HYB-E0004 — `misc` is not a category; use `other` and put the specifics in the reason",
+      "rule": "MANAGED",
+      "tier0_rule_id": "MANAGED"
+    },
+    {
+      "code": "HYB-E1001",
+      "name": "unresolved-name",
+      "category": "resolve",
+      "severity": "error",
+      "title": "name is not available in this scope",
+      "summary": "The name is not declared, not imported, or not visible here. Some builtin names (e.g. `error`) require their package to be imported first.",
+      "fixits": [
+        "import the package that declares it",
+        "check the spelling (foreign names are normalized to snake_case at binding time)"
+      ],
+      "example": "fn f() error { return nil }  // reject: HYB-E1001 until `errors` is imported",
+      "rule": "M"
+    },
+    {
+      "code": "HYB-E2001",
+      "name": "defer-non-call",
+      "category": "type",
+      "severity": "error",
+      "title": "defer requires a call expression",
+      "summary": "`defer` of a non-call expression is a compile error.",
+      "fixits": [
+        "defer the call itself: `defer f.close()?` instead of `defer f.close`"
+      ],
+      "example": "defer f.close   // reject: HYB-E2001 — defer of a non-call",
+      "rule": "P"
+    },
+    {
+      "code": "HYB-E2002",
+      "name": "multi-value-not-tuple",
+      "category": "type",
+      "severity": "error",
+      "title": "a multi-value return is not a tuple",
+      "summary": "Hybrid has no tuples (T23). A function returning two values can only appear in a define (`a, b := f()`), a return, or an if-init — never as a single value.",
+      "fixits": [
+        "bind both values: `lo, hi := minmax(3, 9)`"
+      ],
+      "example": "p := minmax(3, 9)   // reject: HYB-E2002 — multi-value is not a tuple",
+      "rule": "T23"
+    },
+    {
+      "code": "HYB-E3001",
+      "name": "not-sendable-spawn",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "value is not sendable at a task spawn site",
+      "summary": "Only channels, atomics, immutable values, moved values, fresh literals of sendable parts, and `managed` values may cross a task spawn (Tier-0 rule O4: classes 1-6). A named mutable GC value (map, slice, struct, pointer-to-mutable) shared across tasks must go through a channel, a copy, an explicit `move`, or `managed`.",
+      "fixits": [
+        "route updates through a channel instead of sharing the value",
+        "copy the data the task needs and send the copy",
+        "transfer ownership: `task worker(move counter)` — the binding (and every alias) must be unused afterward",
+        "wrap the shared state in a `managed` block (unchecked: Go DRF-SC applies; audited by --report-managed)"
+      ],
+      "example": "task worker(counter)   // reject: HYB-E3001 — `counter` is a mutable map",
+      "rule": "O4",
+      "tier0_rule_id": "A1c"
+    },
+    {
+      "code": "HYB-E3002",
+      "name": "not-sendable-send",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "value is not sendable at a channel send",
+      "summary": "Same sendability classes as spawn sites (O4), enforced at every channel send. A fresh literal is only sendable when its reference-typed parts are sendable (O4.6 deep sendability).",
+      "fixits": [
+        "send a copy or a fresh literal instead of a live shared value",
+        "send ownership with `move` if this task is done with the value (aliases freeze, O5)",
+        "share via channel discipline or `managed` instead"
+      ],
+      "example": "jobs <- job{input: v, data: shared_map}   // reject: HYB-E3002 — `shared_map` is a live mutable map",
+      "rule": "O4.6",
+      "tier0_rule_id": "A1c"
+    },
+    {
+      "code": "HYB-E3003",
+      "name": "use-after-move",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "value used after ownership was moved away",
+      "summary": "After `move x` at a spawn/send/assignment/return — or after a consuming API call — the binding and every live alias are frozen: any use, read or write, is a use-after-move (O5.1/O5.2). Reads are included deliberately: the receiver may mutate concurrently, and Go's DRF-SC defines a concurrent unsynchronized read/write as a race.",
+      "fixits": [
+        "compute what you need BEFORE the move and send it along",
+        "keep ownership here and send a copy",
+        "have the receiver report results back over a channel"
+      ],
+      "example": "results <- move agg; agg[\"total\"] = 1   // reject: HYB-E3003 — frozen alias",
+      "rule": "O5",
+      "tier0_rule_id": "A1b"
+    },
+    {
+      "code": "HYB-E3004",
+      "name": "move-on-gc-field",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "move applies to whole bindings and own-handle fields, not GC fields",
+      "summary": "`move x.field` where the field is a slice/map/struct is rejected: the parent binding still aliases the storage, so the freeze cannot be sound (O5.4).",
+      "fixits": [
+        "copy the field out and send the copy",
+        "move the whole value instead"
+      ],
+      "example": "jobs <- move s.data   // reject: HYB-E3004 — move the whole `s` or copy `s.data`",
+      "rule": "O5.4",
+      "tier0_rule_id": "A1b"
+    },
+    {
+      "code": "HYB-E3005",
+      "name": "unproven-at-boundary",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "value at a spawn/send boundary the checker could not prove safe (fail-closed)",
+      "summary": "The fail-closed boundary (O4.9, rule FC): a value whose type the checker could not resolve — an unresolvable name, an untyped unknown, an unsupported operation affecting ownership or cross-task sharing — used to pass silently; it no longer does. What the checker cannot prove is not called safe. Crossing the boundary requires making the type visible to the checker, or an explicit, auditable `managed` block (HYB-E8001, counted by --report-managed). This is what makes the Tier-0 guarantee a precise contract: everything the checker accepts is proven; everything else is named.",
+      "fixits": [
+        "ascribe the type at the declaration (`var x map[string]int = ...`) so the checker can classify it",
+        "route the value through a channel of a known sendable element type instead of sharing it",
+        "if the share is genuinely guarded, wrap the site in `managed(\"why this bypass is safe\", \"category\") { ... }` — the explicit, auditable hatch (counted by --report-managed; categories: mutex, atomic, actor, finalizer, interop, other)"
+      ],
+      "example": "task handle(blob)          // reject: HYB-E3005 — blob's type did not resolve; the checker cannot prove it safe",
+      "rule": "O4.9",
+      "tier0_rule_id": "FC"
+    },
+    {
+      "code": "HYB-E3006",
+      "name": "write-to-const",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "cannot write to a `const` binding",
+      "summary": "`const` is a compile-time constant and the only DEEP immutability in MVP (SPEC-LANGUAGE T22): no rebind of the binding, no element/index write, no field store through it. A file-level `const` lowers to package-level state that every task body reaches ambiently, so an accepted write would be a data race carrying zero spawn-site evidence (issue #37). Reads stay legal — deep immutability bans the write, not the value.",
+      "fixits": [
+        "make the value a `let`/`var` local and cross task boundaries with a proof (owned `move`, channel send, or `managed`)",
+        "keep the `const` and write to a local copy inside the task",
+        "if the state must be shared and updated, guard the access with `managed(\"why this is safe\", \"mutex\"|\"atomic\"|\"actor\") { ... }` — the explicit, auditable hatch (categories: mutex, atomic, actor, finalizer, interop, other)"
+      ],
+      "example": "const cells = [0]; cells[0] = cells[0] + 1   // reject: HYB-E3006 — `cells` is deeply immutable (T22)",
+      "rule": "T22",
+      "tier0_rule_id": "IMMUT"
+    },
+    {
+
+      "code": "HYB-E3007",
+      "name": "send-target-not-channel",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "the target of a send must be a channel",
+      "summary": "`expr <- value` where `expr` resolves to a non-channel shape is rejected: a send is only well-typed against a `chan T`, and the accepted-subset contract is that every accepted program emits buildable Go (issue #77 — a void call or other non-channel used as a send target used to pass with 0 diagnostics and then fail `go build`). An UNRESOLVABLE target stays fail-closed under HYB-E3005 (O4.9) instead.",
+      "fixits": [
+        "send to a `chan T` binding (`ch := make(chan T, n)` or a `chan T` parameter)",
+        "if the `<-expr` line was meant as a RECEIVE, put the channel expression first: `v := <-ch` — a statement starting with `<-` is a receive, and a `<-` on a new line never continues the previous statement"
+      ],
+      "example": "noop() <- 1   // reject: HYB-E3007 — `noop()` is a void call, not a channel",
+      "rule": "O4",
+      "tier0_rule_id": "A1c"
+    },
+
+    {
+      "code": "HYB-E3010",
+      "name": "loop-label-out-of-scope",
+      "category": "resolve",
+      "severity": "error",
+      "title": "`break loop` / `continue loop` has no enclosing loop to target",
+      "summary": "The `loop` label on `break`/`continue` binds to the nearest enclosing `for`/`loop` statement (SPEC-LANGUAGE LX14). Outside any loop the label has no target: the emitter would lower it to `break hyLoop` / `continue hyLoop` against an undefined Go label, which fails `go vet`/`go build` with `invalid break label hyLoop`. Labels do not cross function or closure boundaries (Go's rule, inherited). Plain `break`/`continue` (no label) inside no loop is separately a parse-level concern; this check covers the labeled form wherever it appears in a checked function body.",
+      "fixits": [
+        "remove the `loop` label — plain `break`/`continue` already targets the innermost enclosing loop",
+        "move the statement inside the `for`/`loop` it is meant to exit",
+        "if the target is an OUTER loop from inside a nested one, keep `break loop` but ensure the statement is lexically inside that outer loop (the emitter labels the owning loop automatically)"
+      ],
+      "example": "fn main() { break loop }   // reject: HYB-E3010 — no enclosing loop",
+      "rule": "LX14",
+      "tier0_rule_id": "LABEL"
+    },
+    {
+      "code": "HYB-E3011",
+      "name": "channel-element-type-mismatch",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "value does not match the channel's element type",
+      "summary": "A send `ch <- v` or a typed receive into a binding (`var n T = <-ch`) where the channel's element type and the value/target have CERTAIN, incompatible TypeShape classes (primitive vs string vs named struct vs chan vs map vs slice...) is rejected: the accepted-subset contract is that every accepted program emits buildable Go, and these used to die in `go build` with `cannot use ... as ... value in send` / assignment (issue #146). Channel DIRECTION is checked elsewhere (HYB-E3007 and friends); this rule covers the ELEMENT TYPE. Only certain mismatches are reported — Unknown, opaque/foreign, or unnamed struct shapes stay permissive (a false reject is worse than a missed one). A value already rejected as non-sendable (HYB-E3002) keeps that diagnostic alone — no cascade.",
+      "fixits": [
+        "send a value of the declared element type (`ch <- job{cost: 1}` into `chan job`, or declare `chan int` when sending `7`)",
+        "on receive, ascribe the channel's element type (`var n job = <-ch`) or let inference pick it up (`n := <-ch`)"
+      ],
+      "example": "struct job { cost int }\nch := make(chan job, 1)\nch <- 7   // reject: HYB-E3011 — `7` is not a `job`",
+      "rule": "O4",
+      "tier0_rule_id": "A1c"
+    },
+    {
+      "code": "HYB-E3101",
+      "name": "handle-loan-conflict",
+      "category": "ownership-loans",
+      "severity": "error",
+      "title": "mutating call conflicts with a live borrow loan",
+      "summary": "A mutating-mode call on a boundary handle conflicts with any live borrow-mode loan on the same handle (O7). Borrow loans live non-lexically, from creation to last use — e.g. across a whole iteration loop.",
+      "fixits": [
+        "collect-then-mutate: gather what you need into locals, let the loan die at its last use, THEN mutate",
+        "move the mutating call after the loop"
+      ],
+      "example": "for u in doc.array(\"users\")? { doc.set(\"pruned\", true)? }   // reject: HYB-E3101",
+      "rule": "O7",
+      "tier0_rule_id": "A2"
+    },
+    {
+      "code": "HYB-E3102",
+      "name": "map-slot-loan-invalidated",
+      "category": "ownership-loans",
+      "severity": "error",
+      "title": "map insert/delete invalidates a live map-slot loan",
+      "summary": "`svc := &m[k]` is a unique loan on slot k, live from creation to last use (non-lexical). Any insert/delete on the same map inside that window may rehash and move the slot (O8).",
+      "fixits": [
+        "reorder: finish the slot mutation first, then insert",
+        "copy-out / modify / store-back (Go-heap reads are copies, O9)"
+      ],
+      "example": "svc := &e.services[x]; e.services[y] = v; svc.tag = t   // reject: HYB-E3102",
+      "rule": "O8",
+      "tier0_rule_id": "A3"
+    },
+    {
+      "code": "HYB-E3103",
+      "name": "borrow-in-field",
+      "category": "ownership-loans",
+      "severity": "error",
+      "title": "struct fields never hold borrows",
+      "summary": "Struct fields hold owned values, GC values, ids, or own-handles — never borrows, never borrow-handles (O12). This is why zero annotations is achievable: the #1 annotation-forcing shape is designed out.",
+      "fixits": [
+        "store the index or an id and re-view through the handle at the use site",
+        "process the element inside the loop body so the loan dies each iteration"
+      ],
+      "example": "struct auditor { cur serde_json.view }   // reject: HYB-E3103 — store a copy or an id",
+      "rule": "O12",
+      "tier0_rule_id": "A6"
+    },
+    {
+      "code": "HYB-E3104",
+      "name": "loan-escape",
+      "category": "ownership-loans",
+      "severity": "error",
+      "title": "a loan cannot escape its function",
+      "summary": "Loans are function-local in Tier 0 (O2): returning `&container[i]` or any borrow from a function is a compile error. A lifetime parameter is deliberately NOT offered — that is the no-visible-lifetimes promise.",
+      "fixits": [
+        "make the mutation a method on the owner so the loan stays in one frame",
+        "return the index and let the caller do the access",
+        "return a copy (Go-heap reads are copies, O9)"
+      ],
+      "example": "return &reg.counters[i]   // reject: HYB-E3104 — loans never escape functions",
+      "rule": "O2",
+      "tier0_rule_id": "LOAN-ESCAPE"
+    },
+    {
+      "code": "HYB-E4001",
+      "name": "nil-for-non-nilable",
+      "category": "nil-safety",
+      "severity": "error",
+      "title": "this type has no nil",
+      "summary": "nil exists only for `error` and the foreign-Go perimeter. Maps and slices have zero values, not nil (N-rules).",
+      "fixits": [
+        "use the zero value `map[string]int{}` or `[]int{}`",
+        "use `option[[]int]` if absence is the meaning"
+      ],
+      "example": "var s []int = nil   // reject: HYB-E4001 — use []int{} or option[[]int]",
+      "rule": "N",
+      "tier0_rule_id": "N1"
+    },
+    {
+      "code": "HYB-E4002",
+      "name": "enum-no-zero-value",
+      "category": "nil-safety",
+      "severity": "error",
+      "title": "this enum has no zero value",
+      "summary": "An enum's zero value is its first variant only if that variant is payload-free; otherwise `var e E` is a compile error.",
+      "fixits": [
+        "initialize explicitly: `e := some(3)`",
+        "reorder variants so the first is the payload-free default"
+      ],
+      "example": "var e option[int]   // reject: HYB-E4002 — option[T] has no zero value",
+      "rule": "N"
+    },
+    {
+      "code": "HYB-E5001",
+      "name": "match-not-exhaustive",
+      "category": "match",
+      "severity": "error",
+      "title": "match is not exhaustive",
+      "summary": "Every enum match must cover all variants (a `_` arm may be last). The missing variant names are listed in the error.",
+      "fixits": [
+        "add the missing arm(s)",
+        "add a final `_` arm if the remaining cases are truly impossible"
+      ],
+      "example": "match s { shape::circle => ... }   // reject: HYB-E5001 — missing square/triangle",
+      "rule": "T"
+    },
+    {
+
+      "code": "HYB-E6001",
+      "name": "div-by-const-zero",
+      "category": "overflow-bounds",
+      "severity": "error",
+      "title": "division or modulo by constant zero",
+      "summary": "A `/` or `%` whose divisor is an integer literal `0` is rejected: Go refuses to compile that expression (`invalid operation: division by zero`), so an accepted Hybrid program would emit unbuildable Go (issue #149). Only the literal-constant case is in scope — a non-constant zero divisor stays a run-time panic, matching Go.",
+      "fixits": [
+        "replace the constant `0` divisor with a non-zero value",
+        "if the divisor is meant to be dynamic, bind it to a variable first — run-time division by zero is a panic, not a compile error"
+      ],
+      "example": "y := x / 0   // reject: HYB-E6001 — constant zero divisor; Go cannot build the emitted module"
+    },
+    {
+      "code": "HYB-E6002",
+      "name": "const-overflows-fixed-width",
+      "category": "overflow-bounds",
+      "severity": "error",
+      "title": "constant overflows its declared fixed-width type",
+      "summary": "A local or file-level binding whose declared type is a fixed-width integer and whose initializer is an integer constant outside that type's range is rejected: Go refuses to compile the emitted declaration (`cannot use N as T value (overflows)`), so an accepted Hybrid program would emit unbuildable Go (issue #148). Only the constant-initializer case is in scope — a variable operand stays a runtime truncation / conversion path (SPEC-LANGUAGE X4).",
+      "fixits": [
+        "use a constant that fits the declared type (e.g. `127` for `int8`, `255` for `uint8`/`byte`)",
+        "widen the declared type (e.g. `int16` / `int`) so the constant is representable",
+        "if truncation is intentional, convert from a variable (`x := 300; y := int8(x)`) — SPEC X4 defines runtime truncation for non-constant operands"
+      ],
+      "example": "var n int8 = 300   // reject: HYB-E6002 — 300 overflows int8; Go cannot build the emitted module",
+      "rule": "BUILDABLE"
+    },
+    {
+      "code": "HYB-E7001",
+      "name": "boundary-pointer-field",
+      "category": "boundary",
+      "severity": "error",
+      "title": "pointer fields in by-value boundary structs are forbidden",
+      "summary": "Types crossing the boundary follow the repr(C)-equivalent layout rules (B-rules); pointer fields inside a by-value struct are forbidden — route them as fields per the ABI.",
+      "fixits": [
+        "route the value as an id/handle field instead of a pointer"
+      ],
+      "example": "struct crossing { next *node }   // reject: HYB-E7001 for by-value crossing",
+      "rule": "B"
+    },
+    {
+      "code": "HYB-E7002",
+      "name": "boundary-concrete-types",
+      "category": "boundary",
+      "severity": "error",
+      "title": "boundary calls need concrete types",
+      "summary": "A generic (un-instantiated) type cannot cross the boundary; instantiate first.",
+      "fixits": [
+        "instantiate the generic type at the call site first, then cross"
+      ],
+      "example": "rust_call(generic_map)   // reject: HYB-E7002 — instantiate first",
+      "rule": "B"
+    },
+    {
+      "code": "HYB-E8001",
+      "name": "managed-share",
+      "category": "lint",
+      "severity": "warning",
+      "title": "spawn/send inside a managed block (unchecked share)",
+      "summary": "The `managed` hatch suppresses the sendability check for this site: the contract is Go's DRF-SC discipline with `-race` as the backstop. Linted and counted by `--report-managed` (O6.3). Warnings can never fail the build.",
+      "fixits": [
+        "prefer the channel redesign (per-task state, merge over a channel)",
+        "keep or add a lock if the share is genuinely guarded",
+        "accept the hatch knowingly: audit it via --report-managed"
+      ],
+      "example": "managed(\"counter access guarded by a mutex\", \"mutex\") { task tally(counter) }   // warning: HYB-E8001 — unchecked share, counted",
+      "rule": "O6",
+      "tier0_rule_id": "MANAGED"
+    },
+    {
+      "code": "HYB-E9001",
+      "name": "toolchain-mismatch",
+      "category": "tooling",
+      "severity": "error",
+      "title": "toolchain does not match the pinned version",
+      "summary": "`hyb build` enforces the project's version pins (go1.26.9 / Rust 1.99.0 per tools/env.sh) so emitted Go and the compiler behave identically everywhere. The installed toolchain's version differs from the pin. Lints and checks stay available; builds stop.",
+      "fixits": [
+        "install the pinned toolchain version (see tools/env.sh for the exact pins)",
+        "source tools/env.sh so PATH picks up the pinned Go at /home/z/tools/go",
+        "change the pin deliberately: update tools/env.sh, PLAN.md's environment row, and this registry entry in the same commit"
+      ],
+      "example": "hyb build prog.hy -o out/   // reject: HYB-E9001 — go1.21 found, go1.26.9 pinned",
+      "rule": "TOOL"
+    },
+    {
+      "code": "HYB-E9002",
+      "name": "generate-no-package",
+      "category": "tooling",
+      "severity": "error",
+      "title": "no Go package beside the .hy file",
+      "summary": "`hyb generate` emits the transpiled Go INTO the directory's existing package — but .hy files have no package clause BY DESIGN (the emitted file joins the sibling .go files' package). A directory without any `package <name>` clause gives the emitter nothing to join.",
+      "fixits": [
+        "add any .go file with a `package <name>` clause beside the .hy file (or run `hyb vendor-runtime <dir>` for a fresh go.mod project)",
+        "an existing go.mod project: point generate at the package directories (go:generate hyb generate ./...)"
+      ],
+      "example": "hyb generate ./internal/thing   // reject: HYB-E9002 — ./internal/thing has no .go files; add one with `package thing`",
+      "rule": "",
+      "tier0_rule_id": null
+    }
+  ]
+}

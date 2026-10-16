@@ -1,0 +1,974 @@
+//! Lexer for the Hybrid language (SPEC-LANGUAGE.md §1.1–1.4; the corpus,
+//! spikes and examples are ground truth where the skeleton is silent).
+//!
+//! Design notes:
+//!   * Tokens carry `Span`s (1-based line/col); the parser copies them onto
+//!     AST nodes.
+//!   * Comments (`//`, non-nested `/* */` per LX8) are skipped. Newlines are
+//!     plain whitespace: statement boundaries come from grammar lookahead,
+//!     not semicolons (LX9). Documented limitation: a statement-leading `-`
+//!     would parse as a continuation of the previous expression — no
+//!     corpus/spike/example file does this.
+//!   * Interpolated strings use a MODE STACK (LX7): inside `"…"` a `{`
+//!     pushes an expression frame (full sub-lexing, including NESTED
+//!     strings, e.g. `"{m["fox"]}"` — corpus 19), `}` pops it. A string
+//!     therefore lexes as
+//!     StrChunk InterpOpen <expr tokens> InterpClose … StrEnd
+//!     and the parser assembles `Expr::Interp` (or `Lit::Str` when the
+//!     string has no interpolation). `{{` / `}}` escape literal braces.
+//!     Raw strings (backticks) are verbatim: no escapes, no interpolation.
+//!   * `in` is NOT lexed as a keyword: spike-6 04 (must-parse) uses `in` as
+//!     an ordinary channel name (`fn squarer(in <-chan int, …)`,
+//!     `for v in in`). It is a contextual keyword the for-parser looks for
+//!     as `Ident("in")`.
+//!   * Identifiers are `[a-z_][a-z0-9_]*` (LX2); anything containing an
+//!     uppercase letter is a lexical HYB-E0001 (identifier-case) error.
+//!   * Integer literals keep their base prefix; `_` digit separators are
+//!     stripped at lex time (`1_000_000` → `1000000`).
+
+use hy_diag::{Diagnostic, Pos, Span};
+
+/// Parse/lex error code. `HYB-E0002` is the intended "parse-error" slot in
+/// the E0 (parse) category — not yet registered in hy-diag's table; an
+/// unregistered code passes through `Diagnostic::error` cleanly (no
+/// misleading fix-its). The lead registers it when convenient.
+pub const PARSE_ERR_CODE: &str = "HYB-E0002";
+
+/// Registered lexical code for LX2 identifier-case violations.
+const IDENT_CASE_CODE: &str = "HYB-E0001";
+
+// ---------------------------------------------------------------------------
+// Tokens
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tok {
+    Ident(String),
+    /// Reserved words (LX3). `in` is notably absent — see module docs.
+    Kw(&'static str),
+    Int(String),
+    Float(String),
+    CharLit(char),
+    /// One cooked (escape-resolved) literal chunk of a `"…"` string.
+    StrChunk(String),
+    /// Terminates a `"…"` string.
+    StrEnd,
+    /// `{` inside a string: starts an embedded expression.
+    InterpOpen,
+    /// `}` closing an embedded expression.
+    InterpClose,
+    /// Raw string (backticks), verbatim.
+    RawStr(String),
+    /// Operators and punctuation, spelled exactly (`:=`, `<-`, `..=`, …).
+    Punct(&'static str),
+    Eof,
+}
+
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub tok: Tok,
+    pub span: Span,
+}
+
+/// Reserved words (LX3) + the reserved-for-future list (error to use today).
+const KEYWORDS: &[&str] = &[
+    "break",
+    "chan",
+    "const",
+    "continue",
+    "defer",
+    "else",
+    "enum",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "import",
+    "let",
+    "loop",
+    "managed",
+    "match",
+    "move",
+    "package",
+    "pub",
+    "return",
+    "select",
+    "struct",
+    "task",
+    "true",
+    "type",
+    "var",
+    // reserved for future use (error to use today):
+    "unsafe",
+    "go",
+    "func",
+    "interface",
+    "trait",
+    "where",
+    "use",
+    "mod",
+    "as",
+    // `mut` is a Rust-ism SPEC-LANGUAGE LX3 deliberately does NOT take
+    // (immutability is binding-level `let`, T22). It sat unreserved and
+    // `mut x := 3` silently emitted the word `mut` into Go — a broken
+    // build from accepted source. Reserved so it fails at parse.
+    "mut",
+    // `while` is the same trap one word over: Hybrid's while-form is
+    // `for cond { }` (ForKind::While). Unreserved, `while x > 0 { … }`
+    // parsed as ident `while` + expr + orphan block and emitted the word
+    // `while` into Go (`undefined: while` from go vet). Reserved so it
+    // fails at parse instead (issue #103).
+    "while",
+    // Select-arm words (issue #104 + pr-22/pr-108 seam): `case` is
+    // RESERVED — Go-style `case <-ch:` used to silently parse as a Send
+    // on ident `case` and emit `case case <- ch:` (invalid Go); now it
+    // fails cleanly at parse. `default` is deliberately NOT reserved:
+    // pr-22's contextual design (a select-arm head only, before `:`)
+    // keeps channels named `default` legal — see SPEC-LANGUAGE LX14's
+    // select paragraph.
+    "case",
+];
+
+/// Lex a whole source file. On success the token stream ends with a single
+/// `Tok::Eof`. On failure returns every lexical diagnostic collected.
+pub fn lex(path: &str, src: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
+    let mut lx = Lexer::new(path, src);
+    let mut toks = Vec::new();
+    while let Some(t) = lx.produce() {
+        let is_eof = matches!(t.tok, Tok::Eof);
+        toks.push(t);
+        if is_eof {
+            break;
+        }
+    }
+    if lx.diags.is_empty() {
+        Ok(toks)
+    } else {
+        Err(lx.diags)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lexer state machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum Frame {
+    /// Inside the literal part of a `"…"` string. `emitted_any` suppresses
+    /// empty chunk tokens after the first (the first chunk — even empty —
+    /// is what tells the parser a string begins).
+    Str { emitted_any: bool },
+    /// Inside a `{…}` interpolation of a string. `depth` tracks nested
+    /// braces (e.g. a struct literal inside an interpolation).
+    Interp { depth: u32 },
+}
+
+struct Lexer<'a> {
+    path: String,
+    chars: Vec<char>,
+    i: usize,
+    line: u32,
+    col: u32,
+    diags: Vec<Diagnostic>,
+    frames: Vec<Frame>,
+    /// One deferred token (a StrChunk is always followed by its StrEnd /
+    /// InterpOpen in the same segment scan).
+    pending: Option<Token>,
+    eof_done: bool,
+    _src: &'a str,
+}
+
+impl<'a> Lexer<'a> {
+    fn new(path: &str, src: &'a str) -> Self {
+        Lexer {
+            path: path.to_string(),
+            chars: src.chars().collect(),
+            i: 0,
+            line: 1,
+            col: 1,
+            diags: Vec::new(),
+            frames: Vec::new(),
+            pending: None,
+            eof_done: false,
+            _src: src,
+        }
+    }
+
+    // -- low-level cursor ---------------------------------------------------
+
+    fn at(&self, off: usize) -> Option<char> {
+        self.chars.get(self.i + off).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.chars.get(self.i).copied()?;
+        self.i += 1;
+        if c == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(c)
+    }
+
+    fn pos(&self) -> Pos {
+        Pos::new(self.line, self.col)
+    }
+
+    fn tok(&self, start: Pos, tok: Tok) -> Token {
+        Token {
+            tok,
+            span: Span::new(start, self.pos()),
+        }
+    }
+
+    fn diag(&mut self, code: &str, start: Pos, msg: impl Into<String>) {
+        self.diags.push(Diagnostic::error(
+            code,
+            self.path.clone(),
+            Span::new(start, self.pos()),
+            msg,
+        ));
+    }
+
+    // -- main driver ----------------------------------------------------------
+
+    fn produce(&mut self) -> Option<Token> {
+        if let Some(t) = self.pending.take() {
+            return Some(t);
+        }
+        loop {
+            if self.eof_done {
+                return None;
+            }
+            match self.frames.last().cloned() {
+                Some(Frame::Str { emitted_any }) => {
+                    if let Some(t) = self.lex_str_segment(emitted_any) {
+                        return Some(t);
+                    }
+                }
+                Some(Frame::Interp { .. }) | None => {
+                    if let Some(t) = self.lex_code() {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+    }
+
+    // -- code mode (top level and inside interpolations) ---------------------
+
+    fn skip_trivia(&mut self) {
+        loop {
+            match self.at(0) {
+                Some(c) if c.is_whitespace() => {
+                    self.bump();
+                }
+                Some('/') if self.at(1) == Some('/') => {
+                    while let Some(c) = self.at(0) {
+                        if c == '\n' {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
+                Some('/') if self.at(1) == Some('*') => {
+                    let start = self.pos();
+                    self.bump();
+                    self.bump();
+                    let mut closed = false;
+                    while let Some(c) = self.at(0) {
+                        if c == '*' && self.at(1) == Some('/') {
+                            self.bump();
+                            self.bump();
+                            closed = true;
+                            break;
+                        }
+                        self.bump();
+                    }
+                    if !closed {
+                        self.diag(PARSE_ERR_CODE, start, "unterminated block comment");
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn lex_code(&mut self) -> Option<Token> {
+        self.skip_trivia();
+        let start = self.pos();
+        let Some(c) = self.at(0) else {
+            // EOF: close any open interpolation frame with a diagnostic so
+            // the parser sees a determinate end.
+            if let Some(f) = self.frames.last().cloned() {
+                if matches!(f, Frame::Interp { .. }) {
+                    self.frames.pop();
+                    self.diag(
+                        PARSE_ERR_CODE,
+                        start,
+                        "unterminated interpolation: expected '}'",
+                    );
+                }
+            }
+            self.eof_done = true;
+            return Some(self.tok(start, Tok::Eof));
+        };
+
+        // string starts (pushes a Str frame; the next produce() call scans it)
+        if c == '"' {
+            self.bump();
+            self.frames.push(Frame::Str { emitted_any: false });
+            return None; // re-dispatch
+        }
+
+        // interpolation / block braces
+        if c == '{' {
+            self.bump();
+            if let Some(Frame::Interp { depth }) = self.frames.last_mut() {
+                *depth += 1;
+            }
+            return Some(self.tok(start, Tok::Punct("{")));
+        }
+        if c == '}' {
+            self.bump();
+            match self.frames.last_mut() {
+                Some(Frame::Interp { depth }) if *depth == 0 => {
+                    self.frames.pop();
+                    return Some(self.tok(start, Tok::InterpClose));
+                }
+                Some(Frame::Interp { depth }) => {
+                    *depth -= 1;
+                    return Some(self.tok(start, Tok::Punct("}")));
+                }
+                _ => return Some(self.tok(start, Tok::Punct("}"))),
+            }
+        }
+
+        // identifiers / keywords
+        if c == '_' || c.is_ascii_lowercase() || c.is_ascii_uppercase() {
+            return Some(self.lex_ident_or_kw());
+        }
+
+        // numbers (incl. leading `.` floats)
+        if c.is_ascii_digit() || (c == '.' && self.at(1).map(|d| d.is_ascii_digit()) == Some(true))
+        {
+            return Some(self.lex_number());
+        }
+
+        // char literals
+        if c == '\'' {
+            return Some(self.lex_char());
+        }
+
+        // raw strings
+        if c == '`' {
+            return Some(self.lex_raw_str());
+        }
+
+        Some(self.lex_punct())
+    }
+
+    fn lex_ident_or_kw(&mut self) -> Token {
+        let start = self.pos();
+        let mut s = String::new();
+        while let Some(c) = self.at(0) {
+            if c == '_' || c.is_ascii_alphanumeric() {
+                s.push(c);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        if s.chars().any(|c| c.is_ascii_uppercase()) {
+            // LX2: Hybrid identifiers are snake_case; foreign names are
+            // normalized at binding time, so uppercase never appears here.
+            self.diag(
+                IDENT_CASE_CODE,
+                start,
+                format!(
+                    "identifier `{}` is not snake_case (LX2) — Hybrid identifiers are lowercase; write it in snake_case",
+                    s
+                ),
+            );
+        }
+        if let Some(kw) = KEYWORDS.iter().find(|k| **k == s) {
+            self.tok(start, Tok::Kw(kw))
+        } else {
+            self.tok(start, Tok::Ident(s))
+        }
+    }
+
+    fn lex_number(&mut self) -> Token {
+        let start = self.pos();
+        let mut s = String::new();
+
+        // prefixed bases
+        if self.at(0) == Some('0')
+            && matches!(
+                self.at(1),
+                Some('x') | Some('X') | Some('o') | Some('O') | Some('b') | Some('B')
+            )
+        {
+            let base = self.at(1).unwrap().to_ascii_lowercase();
+            self.bump();
+            self.bump();
+            s.push('0');
+            s.push(base);
+            while let Some(c) = self.at(0) {
+                if c == '_' || c.is_ascii_alphanumeric() {
+                    if c != '_' {
+                        s.push(c);
+                    }
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            return self.tok(start, Tok::Int(s));
+        }
+
+        // decimal / float
+        let mut is_float = false;
+        while let Some(c) = self.at(0) {
+            if c == '_' || c.is_ascii_digit() {
+                if c != '_' {
+                    s.push(c);
+                }
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        // fractional part — only when a digit follows the dot (so `0..n`
+        // lexes as Int(0) + `..` + Int(n), and `1..=8` as Int + `..=` + Int)
+        if self.at(0) == Some('.') && self.at(1).map(|d| d.is_ascii_digit()) == Some(true) {
+            is_float = true;
+            s.push('.');
+            self.bump();
+            while let Some(c) = self.at(0) {
+                if c == '_' || c.is_ascii_digit() {
+                    if c != '_' {
+                        s.push(c);
+                    }
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+        // exponent
+        if matches!(self.at(0), Some('e') | Some('E')) {
+            let mut k = 1;
+            if matches!(self.at(1), Some('+') | Some('-')) {
+                k = 2;
+            }
+            if self.at(k).map(|d| d.is_ascii_digit()) == Some(true) {
+                is_float = true;
+                // push the exponent marker (and sign) exactly once — the
+                // bumped chars ARE the marker; no extra `e` push.
+                for _ in 0..k {
+                    if let Some(c) = self.bump() {
+                        s.push(c);
+                    }
+                }
+                while let Some(c) = self.at(0) {
+                    if c == '_' || c.is_ascii_digit() {
+                        if c != '_' {
+                            s.push(c);
+                        }
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        if is_float {
+            self.tok(start, Tok::Float(s))
+        } else {
+            self.tok(start, Tok::Int(s))
+        }
+    }
+
+    fn lex_char(&mut self) -> Token {
+        let start = self.pos();
+        self.bump(); // opening quote
+        let ch = match self.at(0) {
+            Some('\\') => {
+                let esc_start = self.pos();
+                self.bump();
+                let e = self.escape_char(false);
+                if e.is_none() {
+                    // diagnostic already recorded; keep going with something
+                    return self.tok(start, Tok::CharLit('\0'));
+                }
+                let _ = esc_start;
+                e.unwrap()
+            }
+            Some(c) => {
+                self.bump();
+                c
+            }
+            None => {
+                self.diag(PARSE_ERR_CODE, start, "unterminated char literal");
+                return self.tok(start, Tok::CharLit('\0'));
+            }
+        };
+        if self.at(0) == Some('\'') {
+            self.bump();
+        } else {
+            self.diag(PARSE_ERR_CODE, start, "unterminated char literal");
+        }
+        self.tok(start, Tok::CharLit(ch))
+    }
+
+    fn lex_raw_str(&mut self) -> Token {
+        let start = self.pos();
+        self.bump(); // opening backtick
+        let mut s = String::new();
+        loop {
+            match self.at(0) {
+                Some('`') => {
+                    self.bump();
+                    return self.tok(start, Tok::RawStr(s));
+                }
+                Some(c) => {
+                    s.push(c);
+                    self.bump();
+                }
+                None => {
+                    self.diag(PARSE_ERR_CODE, start, "unterminated raw string literal");
+                    return self.tok(start, Tok::RawStr(s));
+                }
+            }
+        }
+    }
+
+    fn lex_punct(&mut self) -> Token {
+        let start = self.pos();
+        let rest: String = {
+            let mut r = String::new();
+            for k in 0..4 {
+                match self.at(k) {
+                    Some(c) => r.push(c),
+                    None => break,
+                }
+            }
+            r
+        };
+        // MULTI is scanned IN ORDER and matches by prefix, so the 3-char
+        // compound forms must precede their 2-char prefixes (`<<=` before
+        // `<<`, `>>=` before `>>`).
+        const MULTI: &[&str] = &[
+            "...", "..=", "=>", ":=", "==", "!=", "<=", ">=", "&&", "||", "<-", "<<=", ">>=",
+            "<<", ">>", "++", "--", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "..",
+        ];
+        for m in MULTI {
+            if rest.starts_with(m) {
+                for _ in 0..m.chars().count() {
+                    self.bump();
+                }
+                return self.tok(start, Tok::Punct(m));
+            }
+        }
+        const SINGLE: &[char] = &[
+            '+', '-', '*', '/', '%', '!', '<', '>', '=', '&', '|', '^', '.', ',', ';', ':', '?',
+            '(', ')', '{', '}', '[', ']',
+        ];
+        if SINGLE.contains(&rest.chars().next().unwrap()) {
+            let c = self.bump().unwrap();
+            return self.tok(start, Tok::Punct(static_punct(c)));
+        }
+        let c = self.bump().unwrap_or('\u{fffd}');
+        self.diag(
+            PARSE_ERR_CODE,
+            start,
+            format!("unexpected character `{}`", c),
+        );
+        self.tok(start, Tok::Punct("?"))
+    }
+
+    // -- string mode -----------------------------------------------------------
+
+    /// Scan one segment of a `"…"` string: a literal chunk (terminated by
+    /// `"` or EOF) or an interpolation opener (terminated by `{`). Returns
+    /// `None` never — every path emits a token (chunks carry their StrEnd /
+    /// InterpOpen successor in `pending`).
+    fn lex_str_segment(&mut self, emitted_any: bool) -> Option<Token> {
+        let start = self.pos();
+        let mut cooked = String::new();
+        loop {
+            let Some(c) = self.at(0) else {
+                self.frames.pop();
+                self.diag(PARSE_ERR_CODE, start, "unterminated string literal");
+                if cooked.is_empty() && emitted_any {
+                    return Some(self.tok(start, Tok::StrEnd));
+                }
+                self.pending = Some(self.tok(self.pos(), Tok::StrEnd));
+                return Some(self.tok(start, Tok::StrChunk(cooked)));
+            };
+            match c {
+                '"' => {
+                    self.bump();
+                    self.frames.pop();
+                    if cooked.is_empty() && emitted_any {
+                        return Some(self.tok(start, Tok::StrEnd));
+                    }
+                    self.pending = Some(self.tok(self.pos(), Tok::StrEnd));
+                    return Some(self.tok(start, Tok::StrChunk(cooked)));
+                }
+                '{' => {
+                    if self.at(1) == Some('{') {
+                        self.bump();
+                        self.bump();
+                        cooked.push('{');
+                    } else {
+                        self.bump();
+                        // mark the Str frame as having emitted, push the interp frame
+                        if let Some(Frame::Str { emitted_any }) = self.frames.last_mut() {
+                            *emitted_any = true;
+                        }
+                        self.frames.push(Frame::Interp { depth: 0 });
+                        if cooked.is_empty() && emitted_any {
+                            return Some(self.tok(start, Tok::InterpOpen));
+                        }
+                        self.pending = Some(self.tok(self.pos(), Tok::InterpOpen));
+                        return Some(self.tok(start, Tok::StrChunk(cooked)));
+                    }
+                }
+                '}' => {
+                    // `}}` escapes a literal brace; a lone `}` is literal text
+                    self.bump();
+                    if self.at(0) == Some('}') {
+                        self.bump();
+                    }
+                    cooked.push('}');
+                }
+                '\\' => {
+                    self.bump();
+                    match self.escape_char(true) {
+                        Some(e) => cooked.push(e),
+                        None => {
+                            // unknown escape: keep the char verbatim (diag recorded)
+                            if let Some(c2) = self.bump() {
+                                cooked.push(c2);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    cooked.push(c);
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    /// One escape sequence after `\`. `str_mode` selects the Go string escape
+    /// set (`\uNNNN`); char literals use the rune set (`\u{…}`, LX6).
+    fn escape_char(&mut self, str_mode: bool) -> Option<char> {
+        let start = self.pos();
+        let c = self.bump()?;
+        let out = match c {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '\\' => '\\',
+            '"' => '"',
+            '\'' => '\'',
+            '0' => '\0',
+            'a' => '\u{7}',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'v' => '\u{b}',
+            'x' => {
+                let mut v: u32 = 0;
+                for _ in 0..2 {
+                    let h = self.bump()?;
+                    v = v * 16 + h.to_digit(16)?;
+                }
+                char::from_u32(v)?
+            }
+            'u' => {
+                if str_mode {
+                    let mut v: u32 = 0;
+                    for _ in 0..4 {
+                        let h = self.bump()?;
+                        v = v * 16 + h.to_digit(16)?;
+                    }
+                    char::from_u32(v)?
+                } else {
+                    // rune style: \u{1F600}
+                    if self.bump() != Some('{') {
+                        return None;
+                    }
+                    let mut v: u32 = 0;
+                    loop {
+                        match self.at(0) {
+                            Some(h) if h.is_ascii_hexdigit() => {
+                                v = v * 16 + h.to_digit(16).unwrap_or(0);
+                                self.bump();
+                            }
+                            Some('}') => {
+                                self.bump();
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                    char::from_u32(v)?
+                }
+            }
+            'U' => {
+                let mut v: u32 = 0;
+                for _ in 0..8 {
+                    let h = self.bump()?;
+                    v = v * 16 + h.to_digit(16)?;
+                }
+                char::from_u32(v)?
+            }
+            '1'..='7' => {
+                // octal \NNN
+                let mut v: u32 = c.to_digit(8)?;
+                loop {
+                    let d = self.at(0).and_then(|c| c.to_digit(8));
+                    match d {
+                        Some(d) => {
+                            v = v * 8 + d;
+                            self.bump();
+                        }
+                        None => break,
+                    }
+                }
+                char::from_u32(v)?
+            }
+            _ => {
+                self.diag(
+                    PARSE_ERR_CODE,
+                    start,
+                    format!("unknown escape sequence `\\{}`", c),
+                );
+                return None;
+            }
+        };
+        Some(out)
+    }
+}
+
+fn static_punct(c: char) -> &'static str {
+    match c {
+        '+' => "+",
+        '-' => "-",
+        '*' => "*",
+        '/' => "/",
+        '%' => "%",
+        '!' => "!",
+        '<' => "<",
+        '>' => ">",
+        '=' => "=",
+        '&' => "&",
+        '|' => "|",
+        '^' => "^",
+        '.' => ".",
+        ',' => ",",
+        ';' => ";",
+        ':' => ":",
+        '?' => "?",
+        '(' => "(",
+        ')' => ")",
+        '{' => "{",
+        '}' => "}",
+        '[' => "[",
+        ']' => "]",
+        _ => "?",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toks(src: &str) -> Vec<Tok> {
+        lex("test.hy", src)
+            .expect("lex ok")
+            .into_iter()
+            .map(|t| t.tok)
+            .collect()
+    }
+
+    #[test]
+    fn plain_string_no_interp() {
+        let t = toks(r#"let x = "hello\nworld""#);
+        assert_eq!(
+            t,
+            vec![
+                Tok::Kw("let"),
+                Tok::Ident("x".into()),
+                Tok::Punct("="),
+                Tok::StrChunk("hello\nworld".into()),
+                Tok::StrEnd,
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn interp_with_nested_quotes() {
+        // corpus 19: fmt.println("fox count: {m["fox"]}")
+        let t = toks(r#"fmt.println("fox count: {m["fox"]}")"#);
+        assert_eq!(
+            t,
+            vec![
+                Tok::Ident("fmt".into()),
+                Tok::Punct("."),
+                Tok::Ident("println".into()),
+                Tok::Punct("("),
+                Tok::StrChunk("fox count: ".into()),
+                Tok::InterpOpen,
+                Tok::Ident("m".into()),
+                Tok::Punct("["),
+                Tok::StrChunk("fox".into()),
+                Tok::StrEnd,
+                Tok::Punct("]"),
+                Tok::InterpClose,
+                Tok::StrEnd,
+                Tok::Punct(")"),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn brace_escapes_and_multiple_interps() {
+        let t = toks(r#""brace: {{}} k{seq}-{i}""#);
+        assert_eq!(
+            t,
+            vec![
+                Tok::StrChunk("brace: {} k".into()),
+                Tok::InterpOpen,
+                Tok::Ident("seq".into()),
+                Tok::InterpClose,
+                Tok::StrChunk("-".into()),
+                Tok::InterpOpen,
+                Tok::Ident("i".into()),
+                Tok::InterpClose,
+                Tok::StrEnd,
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_string_with_own_interp_inside_interp() {
+        let t = toks(r#""outer {fmt.println("inner {x}")} tail""#);
+        assert_eq!(
+            t,
+            vec![
+                Tok::StrChunk("outer ".into()),
+                Tok::InterpOpen,
+                Tok::Ident("fmt".into()),
+                Tok::Punct("."),
+                Tok::Ident("println".into()),
+                Tok::Punct("("),
+                Tok::StrChunk("inner ".into()),
+                Tok::InterpOpen,
+                Tok::Ident("x".into()),
+                Tok::InterpClose,
+                Tok::StrEnd,
+                Tok::Punct(")"),
+                Tok::InterpClose,
+                Tok::StrChunk(" tail".into()),
+                Tok::StrEnd,
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_strings_verbatim() {
+        let t = toks(r#"let pat = `^[^@\s]+$`"#);
+        assert_eq!(
+            t,
+            vec![
+                Tok::Kw("let"),
+                Tok::Ident("pat".into()),
+                Tok::Punct("="),
+                Tok::RawStr(r"^[^@\s]+$".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn numbers_and_ranges() {
+        let t = toks("for i in 0..n { x := 1_000_000 y := 0x1F f := 1.5e3 }");
+        assert!(t.contains(&Tok::Int("1000000".into())));
+        // hex digits are kept as written (only the base prefix normalizes)
+        assert!(t.contains(&Tok::Int("0x1F".into())));
+        assert!(t.contains(&Tok::Float("1.5e3".into())));
+        assert!(t.contains(&Tok::Punct("..")));
+    }
+
+    #[test]
+    fn operators_lex_correctly() {
+        let t = toks("a <- b c <-chan d e := f g ..= h i++ j-- k += 1 l ... m");
+        assert!(t.contains(&Tok::Punct("<-")));
+        assert!(t.contains(&Tok::Punct(":=")));
+        assert!(t.contains(&Tok::Punct("..=")));
+        assert!(t.contains(&Tok::Punct("++")));
+        assert!(t.contains(&Tok::Punct("--")));
+        assert!(t.contains(&Tok::Punct("+=")));
+        assert!(t.contains(&Tok::Punct("...")));
+    }
+
+    #[test]
+    fn comments_skipped() {
+        let t = toks("a // line\n /* block /* not nested */ b");
+        assert_eq!(
+            t,
+            vec![Tok::Ident("a".into()), Tok::Ident("b".into()), Tok::Eof,]
+        );
+    }
+
+    #[test]
+    fn in_is_contextual_not_keyword() {
+        // spike-6 04: `fn squarer(in <-chan int, …)` / `for v in in`
+        let t = toks("fn squarer(in <-chan int) { for v in in { } }");
+        assert!(!t.contains(&Tok::Kw("in")));
+        assert!(
+            t.iter()
+                .filter(|t| matches!(t, Tok::Ident(s) if s == "in"))
+                .count()
+                >= 3
+        );
+        assert!(t.contains(&Tok::Kw("chan")));
+    }
+
+    #[test]
+    fn uppercase_identifier_is_lexical_error() {
+        let r = lex("t.hy", "WorkerID := 3");
+        assert!(r.is_err());
+        let diags = r.unwrap_err();
+        assert_eq!(diags[0].code, "HYB-E0001");
+    }
+
+    #[test]
+    fn spans_are_one_based_line_col() {
+        let t = lex("t.hy", "fn main() {\n    x := 1\n}").unwrap();
+        // find the `:=`
+        let d = t.iter().find(|t| t.tok == Tok::Punct(":=")).unwrap();
+        assert_eq!(d.span.start.line, 2);
+        assert_eq!(d.span.start.col, 7);
+    }
+
+    #[test]
+    fn unterminated_string_is_error() {
+        assert!(lex("t.hy", r#"x := "oops"#).is_err());
+    }
+}
